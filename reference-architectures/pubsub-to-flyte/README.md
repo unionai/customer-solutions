@@ -1,6 +1,6 @@
 # Launching Flyte 2 tasks from Google Cloud Pub/Sub
 
-**Reference architecture**
+**Reference architecture - draft for discussion**
 
 ## Contents
 
@@ -112,7 +112,7 @@ and event type, so unrelated bucket activity never reaches the subscriber.
 
 ### 3.2 IAM
 
-Four grants, and three of them are commonly missed:
+Four grants are needed:
 
 | Principal | Role | On | Why |
 |---|---|---|---|
@@ -131,10 +131,6 @@ Two halves, and both are required:
 2. The Google SA has an `iam.workloadIdentityUser` binding for
    `PROJECT.svc.id.goog[NAMESPACE/KSA_NAME]`
 
-**The namespace is part of the identity.** A binding for `[default/subscriber]` grants
-nothing to a pod running in another namespace. This misconfiguration is easy to miss
-because both halves look correct in isolation and nothing fails until the pod
-authenticates.
 
 Note that the **image pull** does not use this identity. The kubelet pulls using the
 node pool's service account before the container exists, so the workload's service
@@ -142,8 +138,7 @@ account never needs registry access.
 
 ### 3.4 Runtime
 
-The subscriber is a long-running process, so it is a **Deployment** — not a Job or
-CronJob, which would tear down the subscription connection. It needs no Service or
+The subscriber is a long-running process, so it is a **Deployment**. It needs no Service or
 Ingress.
 
 On Cloud Run it requires `--min-instances=1` and `--no-cpu-throttling`; without the
