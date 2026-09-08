@@ -330,13 +330,10 @@ A run appears in the Flyte console within seconds.
 
 To size this for your environment:
 
-1.What creates the messages? 
-2. What is the message volume and burst profile, and is it one message per run?
-2. How do you decide which code version production runs, and do you need to roll back
-   without redeploying?
-3. Should runs be attributed to the originating user or tenant? The app calls Flyte with
-   its own credentials, so that identity has to travel in the message and be enforced in
-   the pipeline.
+1. What creates the messages?   
+2. What is the message volume and burst profile, and is it one message per run?  
+2. How do you decide which code version production runs, and do you need to roll back without redeploying?   
+3. Should runs be attributed to the originating user or tenant? The app calls Flyte with its own credentials, so that identity has to travel in the message and be enforced in the pipeline.  
 
 ---
 
