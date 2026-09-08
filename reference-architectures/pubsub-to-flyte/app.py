@@ -1,14 +1,7 @@
 """Pub/Sub subscriber as a Union App, structured as a FastAPI app.
 
-The subscriber is a pull loop, not a request handler, but running it under
-FastAPIAppEnvironment lets the platform manage it the way it expects:
-
-  - `fserve` serves the FastAPI object directly, so no `command=` override
-  - the health endpoint comes from FastAPI instead of a hand-rolled HTTP server
-  - startup and shutdown run on the app lifecycle instead of signal handlers
-
 Deploy:
-    flyte deploy app.py app_env
+    flyte serve app.py app_env
 
 Requirements, one time:
 
