@@ -94,7 +94,7 @@ activity never reaches the subscriber.
 
 ### 2.2 IAM
 
-Four grants. Three of them are easy to miss:
+Four grants needed:
 
 | Principal | Role | On | Why |
 |---|---|---|---|
@@ -109,7 +109,7 @@ Scope grants to the specific topic or subscription rather than the project.
 
 The app needs two, in opposite directions.
 
-**Union.** Store an API key as a secret named `flyte-api-key`; the app reads it from
+**Union.** Store an API key as a Flyte secret; the app reads it from
 `FLYTE_API_KEY`. Mint it from a service identity scoped to the target project and
 domain rather than a personal account, since the key inherits the permissions of
 whoever created it. Rotate on a schedule.
@@ -306,7 +306,7 @@ flyte create secret flyte-api-key --value '<the key>'
 Set `GCP_PROJECT` and `SUBSCRIPTION` in `app.py`, then:
 
 ```bash
-flyte deploy app.py app_env
+flyte serve app.py app_env
 ```
 
 The logs should show the app authenticating and subscribing:
@@ -330,17 +330,13 @@ A run appears in the Flyte console within seconds.
 
 To size this for your environment:
 
-1. What is the message volume and burst profile, and is it one message per run? At
-   thousands per minute, batching changes the design.
-2. Is processing the same message twice harmful, or only wasteful?
-3. How do you decide which code version production runs, and do you need to roll back
+1.What creates the messages? 
+2. What is the message volume and burst profile, and is it one message per run?
+2. How do you decide which code version production runs, and do you need to roll back
    without redeploying?
-4. Does per-key ordering matter?
-5. Should runs be attributed to the originating user or tenant? The app calls Flyte with
+3. Should runs be attributed to the originating user or tenant? The app calls Flyte with
    its own credentials, so that identity has to travel in the message and be enforced in
    the pipeline.
-6. What language is your event tooling? Python means the SDK and none of the raw-API
-   work below.
 
 ---
 
