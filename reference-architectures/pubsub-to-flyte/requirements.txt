@@ -1,2 +1,0 @@
-flyte==2.6.12
-google-cloud-pubsub==2.39.2

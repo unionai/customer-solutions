@@ -1,36 +1,33 @@
 # Launching Flyte 2 tasks from Google Cloud Pub/Sub
 
-**Reference architecture - draft for discussion**
+**Reference architecture — draft for discussion**
 
 ## Contents
 
 | File | |
 |---|---|
-| `subscriber.py` | the pull subscriber — set `EVENT_SOURCE=gcs` for object notifications, `json` if you publish your own payloads |
-| `gcs_ingest.py` | example Flyte task accepting an object key |
-| `Dockerfile`, `requirements.txt` | container for the subscriber |
-| `k8s/deployment.yaml` | Deployment manifest, with placeholders to fill in |
+| `app.py` | the subscriber, deployed as a Union App |
+| `gcs_ingest.py` | example task, accepting an object key |
 
 ## Scope
 
-How to run a Flyte 2 task in response to a Pub/Sub message: the recommended pattern,
-what has to be configured, the failure modes that matter in production, and a working
-example you can stand up yourself.
+Running a Flyte 2 task in response to a Pub/Sub message: the architecture, what has to
+be configured, the failure modes that matter in production, and a walkthrough you can
+follow in your own environment.
 
-The worked example reacts to files landing in a GCS bucket, since object notifications
-are the most common source. The pattern is the same for any publisher.
+The example reacts to files arriving in a GCS bucket, since object notifications are the
+most common source. The pattern is the same for any publisher.
 
 ---
 
-## 1. Recommended pattern
+## 1. Architecture
 
-A **pull subscriber that you own** — an ordinary long-running Python process using the
-Pub/Sub client library and the Flyte SDK. It reads the subscription and launches one
+A **pull subscriber running as a Union App**. It reads the subscription and launches one
 Flyte run per message.
 
 ```
-   GCS bucket                    your cluster                    Union
-   ──────────                    ────────────                    ─────
+   GCS bucket                  Union App                      Flyte
+   ──────────                  ─────────                      ─────
    object lands
    trainingdata/*.nc
         │
@@ -38,65 +35,50 @@ Flyte run per message.
         ▼
    Pub/Sub topic
         │
-        │ StreamingPull  ─────▶  subscriber pod
-        │   (outbound)           ├─ map event → task inputs
-        │                        ├─ launch run  ──────────────▶  Flyte task run
-        │                        └─ ack
+        │ StreamingPull  ──▶   subscriber
+        │                      ├─ map event → task inputs
+        │                      ├─ launch run  ──────────────▶  task run
+        │                      └─ ack
         ▼
    dead-letter topic
    (after N failures)
 ```
 
-The subscriber opens **outbound** connections in both directions. It exposes no
-endpoint, receives no inbound traffic, and requires no ingress.
+The subscriber opens outbound connections in both directions. It exposes no endpoint and
+receives no inbound traffic; the HTTP port exists only for health checks.
+
+### Why an App
+
+Union App Serving runs any long-lived process, so the subscriber deploys with
+`flyte deploy` and Union operates it. Compared with running the same process yourself:
+
+- **No cluster resources to maintain.** No Deployment manifest, ServiceAccount, image
+  build pipeline, or `kubectl` rollout.
+- **Project and domain come from the platform.** `flyte.current_project()` and
+  `flyte.current_domain()` read what Union injects into the pod, so the app knows where
+  it is without configuration.
+- **The image is built for you.** `flyte.Image` declares dependencies; the remote builder
+  produces and stores the image.
+- **Standard lifecycle.** `@app_env.on_startup` runs before traffic is served, and the
+  FastAPI shutdown path replaces signal handling.
+- **Health and restarts are handled.** The platform probes the app and restarts it,
+  using the endpoint the app already serves.
 
 ### Why pull rather than push
 
-A push subscription delivering to an HTTPS endpoint is the obvious alternative. We
-recommend against it here for three reasons:
+Pub/Sub push authenticates with a Google-issued OIDC token and cannot send a Union
+credential, so a push receiver must verify Google tokens itself on a public endpoint.
+Pull avoids this: the subscriber authenticates outbound to both Google and Union.
 
-**Authentication.** Pub/Sub push authenticates with a Google-issued OIDC token and
-cannot send a Union credential. Any push receiver must therefore verify Google tokens
-itself, on a publicly reachable endpoint. Pull removes the problem rather than solving
-it: the subscriber authenticates outbound to both Google and Union, and nothing is
-exposed.
-
-**Flow control.** The pull client bounds in-flight work (`max_messages`). Push
-subscriptions deliver as fast as they can and the receiver absorbs it. When a backlog
-drains, that difference decides whether you launch a controlled number of runs or a
-flood of them.
-
-**Batching.** Accumulating several messages into one run is a few lines in a pull
-callback. It is awkward in a request handler, and this need arrives sooner than teams
-expect.
-
-The cost of pull is that it is a long-running process rather than something that scales
-to zero. If a hard scale-to-zero requirement exists, push to Cloud Run is the fallback —
-Google verifies the token via IAM and nothing is public — accepting the loss of flow
-control.
+Pull also gives flow control. `max_messages` bounds work in flight, where a push
+subscription delivers as fast as it can and the receiver absorbs it. When a backlog
+drains, that decides whether you launch a controlled number of runs or a flood.
 
 ---
 
-## 2. Components and ownership
+## 2. Configuration
 
-| Component | Owner | Notes |
-|---|---|---|
-| Pub/Sub topic, subscription, dead-letter topic | Customer | ordinary GCP resources |
-| Bucket notification config | Customer | if the source is GCS |
-| Subscriber process and where it runs | Customer | GKE Deployment or Cloud Run |
-| Mapping message → task inputs | Customer | the only genuinely bespoke code |
-| Flyte task and its releases | Customer | deployed to Union |
-| Union API key | Customer | stored in their secret manager |
-
-The integration is deliberately customer-owned. It is ordinary Python against two
-documented client libraries, and it keeps event plumbing inside their own
-infrastructure.
-
----
-
-## 3. Configuration requirements
-
-### 3.1 Pub/Sub
+### 2.1 Pub/Sub
 
 | Setting | Recommendation |
 |---|---|
@@ -105,80 +87,83 @@ infrastructure.
 | Message retention | 7 days |
 | Dead-letter topic | required |
 | Max delivery attempts | 5 |
-| Flow control | `max_messages` sized against tolerable concurrent runs |
+| `max_messages` | sized against tolerable concurrent runs |
 
-If the source is GCS, the notification config should filter server-side by object prefix
-and event type, so unrelated bucket activity never reaches the subscriber.
+For a GCS source, filter server-side by object prefix and event type so unrelated bucket
+activity never reaches the subscriber.
 
-### 3.2 IAM
+### 2.2 IAM
 
-Four grants are needed:
+Four grants. Three of them are easy to miss:
 
 | Principal | Role | On | Why |
 |---|---|---|---|
 | GCS service agent | `pubsub.publisher` | the topic | without it the notification config exists but nothing is delivered |
 | Pub/Sub service agent | `pubsub.publisher` | dead-letter topic | without it messages retry forever instead of dead-lettering |
 | Pub/Sub service agent | `pubsub.subscriber` | the subscription | same |
-| Subscriber's Google SA | `pubsub.subscriber` | the subscription | the only one that is obvious |
+| The subscriber's Google identity | `pubsub.subscriber` | the subscription | reading messages |
 
 Scope grants to the specific topic or subscription rather than the project.
 
-### 3.3 Workload Identity
+### 2.3 Credentials
 
-Two halves, and both are required:
+The app needs two, in opposite directions.
 
-1. The Kubernetes SA is annotated with `iam.gke.io/gcp-service-account`
-2. The Google SA has an `iam.workloadIdentityUser` binding for
-   `PROJECT.svc.id.goog[NAMESPACE/KSA_NAME]`
+**Union.** Store an API key as a secret named `flyte-api-key`; the app reads it from
+`FLYTE_API_KEY`. Mint it from a service identity scoped to the target project and
+domain rather than a personal account, since the key inherits the permissions of
+whoever created it. Rotate on a schedule.
 
+**Google.** Pub/Sub credentials reach the app through Application Default Credentials.
 
-Note that the **image pull** does not use this identity. The kubelet pulls using the
-node pool's service account before the container exists, so the workload's service
-account never needs registry access.
+Create the secret before deploying. If it is missing, the pod is rejected with
+`none of the secret managers injected secret` and the app fails to start.
 
-### 3.4 Runtime
+### 2.4 App settings
 
-The subscriber is a long-running process, so it is a **Deployment**. It needs no Service or
-Ingress.
+Two settings matter:
 
-On Cloud Run it requires `--min-instances=1` and `--no-cpu-throttling`; without the
-latter the CPU is throttled between requests and a background subscriber stalls.
+- `scaling=Scaling(replicas=(1, 1))`. Apps default to scale-to-zero and autoscale on
+  request volume. A subscriber serves no requests, so a default-scaled app is scaled
+  away and stops reading the subscription.
+- A listener on the app port. The platform health-checks it, and `app.py` serves
+  `/health` reporting whether the stream is still running.
 
-### 3.5 Which task version runs
+### 2.5 Which task version runs
 
-The subscriber should name a **release label**, never a code version, and should not use
-"latest" resolution — that would make every deploy an immediate production change with
-no way to pin or roll back.
+The subscriber should name a release label, never a code version, and should not resolve
+"latest" — that makes every deploy an immediate production change with no way to pin or
+roll back.
 
 Deploy each release twice: once under an immutable tag that is a permanent record, and
 once under a label the subscriber pins.
 
 ```bash
-flyte deploy --version 2026-09-04-a3f9c21  pipeline.py env   # immutable record
-flyte deploy --version prod                pipeline.py env   # what production runs
+flyte deploy --version 2026-09-08-a3f9c21  gcs_ingest.py env   # immutable record
+flyte deploy --version prod                gcs_ingest.py env   # what production runs
 ```
 
-Releases and rollbacks then happen entirely on the Flyte side; the subscriber never
-changes. Deploy with meaningful versions — a git SHA or release tag — since auto-generated
-versions are content hashes and unpleasant to promote by hand.
+Releases and rollbacks then happen on the Flyte side and the app never changes. Use
+meaningful versions — a git SHA or release tag — since auto-generated versions are
+content hashes and awkward to promote by hand.
 
 ---
 
-## 4. Reliability semantics
+## 3. Reliability
 
-These decide whether the integration behaves under load and failure. They are properties
-of Pub/Sub, not of Flyte, and apply to any design.
+These are properties of Pub/Sub, and they decide how the integration behaves under load
+and failure.
 
-**Delivery is at-least-once.** Duplicates will happen. Derive the Flyte run name from the
+**Delivery is at-least-once.** Duplicates will happen. Derive the run name from the
 Pub/Sub `messageId`: run names are unique per project and domain, so a redelivery
-collides with the existing run rather than starting a second one. Treat "already exists"
+collides with the existing run instead of starting a second one. Treat "already exists"
 as success. This holds across replicas, because uniqueness is enforced by the platform
 rather than by subscriber state.
 
-**Ack when the run is created, never when it finishes.** Blocking on completion exhausts
+**Ack when the run is created, not when it finishes.** Blocking on completion exhausts
 the ack deadline and triggers redelivery, which launches duplicates.
 
-**Dead-letter the unprocessable.** A message that can never be parsed will otherwise
+**Dead-letter what cannot be processed.** A message that never parses will otherwise
 retry indefinitely. Ack permanently-bad messages rather than nacking them, and attach a
 dead-letter topic for the rest.
 
@@ -187,19 +172,19 @@ out of order. If a pipeline must not run concurrently for a given key, enforce t
 Flyte rather than at the transport.
 
 **Retries have two owners.** Flyte task retries and Pub/Sub redelivery will otherwise
-compete. The usual split: ack on successful launch, let Flyte own execution retries, and
-reserve the dead-letter queue for messages that never launched.
+compete. Ack on successful launch, let Flyte own execution retries, and reserve the
+dead-letter queue for messages that never launched.
 
 ---
 
-## 5. Mapping messages to task inputs
+## 4. Mapping messages to task inputs
 
-The only bespoke code. It is tempting to decode the message body and splat it into the
-task, which works when you control the publisher and shaped the payload to match the task
-signature. It does not work for cloud-generated events.
+The only bespoke code. Decoding the message body and passing it straight to the task
+works when you control the publisher and shaped the payload to match the task signature.
+It does not work for cloud-generated events.
 
-GCS object notifications put routing data in `attributes` and the full object *resource*
-in `data`:
+GCS object notifications put routing data in `attributes` and the object *resource* in
+`data`:
 
 ```
 attributes:  bucketId, objectId, eventType, eventTime
@@ -207,46 +192,45 @@ data:        base64 JSON — {kind, id, selfLink, name, bucket, generation,
                             size, md5Hash, contentType, ...}
 ```
 
-That payload is metadata about the file, not task inputs. Read `attributes` and construct
-inputs explicitly:
+That payload describes the file; it is not task inputs. Passing it as keyword arguments
+sends `kind`, `selfLink` and `md5Hash` to the task and fails. Read `attributes` instead:
 
 ```python
 inputs = {"object_key": f"gs://{attrs['bucketId']}/{attrs['objectId']}"}
 ```
 
-Filter on `eventType` as well — a bucket configured for multiple event types delivers
+Filter on `eventType` as well. A bucket configured for several event types delivers
 deletes and metadata updates through the same subscription.
 
 ---
 
-## 6. Observability
+## 5. Observability
 
-**Log every decision.** A subscriber that launches runs silently is indistinguishable
-from one that is wedged. Log on launch (with the run name and URL), on duplicate
-delivery, on skip, and on failure.
+**Log every decision.** An app that logs nothing looks the same whether it is working or
+stalled. Log on launch with the run name and URL, on duplicate delivery, on skip, and on
+failure.
 
-**Alert on the subscription, not the pod.** The signals that matter:
+**Alert on the subscription, not the app.**
 
 | Signal | Catches |
 |---|---|
 | `num_undelivered_messages` (backlog) | subscriber down or too slow |
-| oldest unacked message age | connected but wedged |
+| oldest unacked message age | connected but stalled |
 | dead-letter topic depth | messages that never launched a run |
-| container restarts | crash loop, which otherwise looks like backlog growth |
+| app restarts | crash loop, which otherwise resembles backlog growth |
 
-**Liveness needs care.** A StreamingPull subscriber can wedge while the process stays
-alive, and with no HTTP server there is nothing to probe by default. Either expose a
-small health endpoint reporting whether the stream is still running, or rely on the
-backlog alerts above.
+**Health should reflect the stream.** A StreamingPull subscriber can stall while the
+process stays alive. `/health` returns 503 when the stream is no longer running, so the
+platform sees the difference.
 
 ---
 
-## 7. Try it yourself
+## 6. Try it yourself
 
-Roughly 30-45 minutes. Substitute your own project, bucket, and cluster.
+Around 30-45 minutes. Substitute your own project, bucket, and subscription.
 
-Prerequisites: a Union instance you can log into, with a project and domain created, and
-the `flyte` CLI configured (`flyte create config --endpoint dns:///<your-endpoint>`).
+Prerequisites: a Union instance with a project and domain, and the `flyte` CLI
+configured (`flyte create config --endpoint dns:///<your-endpoint>`).
 
 **1. Create the topic and let GCS publish to it**
 
@@ -292,117 +276,86 @@ gcloud pubsub subscriptions pull trainingdata-uploads-sub --limit=1 --format=jso
 ```
 
 A message with `attributes.objectId` set means topic, IAM, notification and subscription
-are all correct. Everything after this point is application code. Leave it unacked and
-the subscriber will consume it on first start.
+are correct. Everything after this is application code. Leave it unacked and the app
+will consume it on first start.
 
-**5. Deploy a task that accepts the object**
-
-```python
-@env.task
-async def on_object(object_key: str = "", event_time: datetime = EPOCH) -> str:
-    return f"processing {object_key}"
-```
+**5. Deploy the task**
 
 ```bash
-flyte deploy --version r1   gcs_ingest.py env
-flyte deploy --version prod gcs_ingest.py env
+flyte deploy --version r1 gcs_ingest.py env
 ```
 
-**6. Mint the Union API key**
+**6. Mint the Union API key and store it**
 
-The subscriber authenticates to Union with an API key. It encodes the endpoint, client
-id and secret in a single string, so it is the only Union credential the pod needs.
-
-The command ships in the `flyteplugins-union` package rather than the base CLI:
+`flyte create api-key` ships in the `flyteplugins-union` package rather than the base
+CLI.
 
 ```bash
-uv add --dev flyteplugins-union      # or: pip install flyteplugins-union
-
-# from a machine already logged in to your Union instance
+uv add --dev flyteplugins-union
 uv run flyte create api-key --name pubsub-subscriber-key
 ```
 
-The output is shown **once** — copy it immediately. Store it in Secret Manager and mount
-it as `FLYTE_API_KEY`:
+The output is shown once. Store it as the secret the app expects:
 
 ```bash
-echo -n "<the key>" | gcloud secrets create flyte-api-key --data-file=-
-gcloud secrets add-iam-policy-binding flyte-api-key \
-  --member="serviceAccount:flyte-subscriber@$PROJECT.iam.gserviceaccount.com" \
-  --role=roles/secretmanager.secretAccessor
+flyte create secret flyte-api-key --value '<the key>'
 ```
 
-The key inherits the permissions of the user who minted it, so mint it from a dedicated
-service identity scoped to the target project and domain rather than a personal account.
-Rotate on a schedule — 90 days is a reasonable default — by minting a new key and
-updating the secret.
+**7. Deploy the app**
 
-**7. Grant the subscriber identity and wire Workload Identity**
+Set `GCP_PROJECT` and `SUBSCRIPTION` in `app.py`, then:
 
 ```bash
-gcloud iam service-accounts create flyte-subscriber
-gcloud pubsub subscriptions add-iam-policy-binding trainingdata-uploads-sub \
-  --member="serviceAccount:flyte-subscriber@$PROJECT.iam.gserviceaccount.com" \
-  --role=roles/pubsub.subscriber
-
-kubectl create serviceaccount flyte-subscriber -n YOUR_NS
-kubectl annotate serviceaccount flyte-subscriber -n YOUR_NS \
-  iam.gke.io/gcp-service-account=flyte-subscriber@$PROJECT.iam.gserviceaccount.com
-
-gcloud iam service-accounts add-iam-policy-binding \
-  flyte-subscriber@$PROJECT.iam.gserviceaccount.com \
-  --role=roles/iam.workloadIdentityUser \
-  --member="serviceAccount:$PROJECT.svc.id.goog[YOUR_NS/flyte-subscriber]"
+flyte deploy app.py app_env
 ```
 
-The namespace in that last member string must match the Deployment's namespace.
+The logs should show the app authenticating and subscribing:
 
-**8. Build, push, deploy**
-
-```bash
-gcloud builds submit --tag REGION-docker.pkg.dev/$PROJECT/REPO/flyte-subscriber:v1 .
-kubectl apply -f deployment.yaml
-kubectl logs -n YOUR_NS -l app=flyte-subscriber -f
+```
+authenticated to <project>/<domain>
+subscribed to projects/<gcp-project>/subscriptions/trainingdata-uploads-sub
 ```
 
-**9. Trigger it**
+**8. Trigger it**
 
 ```bash
 gcloud storage cp file.txt gs://YOUR_BUCKET/trainingdata/file-$(date +%s).txt
 ```
 
-A run should appear in the Flyte console within seconds.
+A run appears in the Flyte console within seconds.
 
 ---
 
-## 8. Open questions
+## 7. Open questions
 
-To size and finalise this for your environment:
+To size this for your environment:
 
-1. Where will the subscriber run, and is scale-to-zero a hard requirement?
-2. What is the message volume and burst profile, and is it one message per run? At
+1. What is the message volume and burst profile, and is it one message per run? At
    thousands per minute, batching changes the design.
-3. Is processing the same message twice harmful, or merely wasteful?
-4. How do you decide which code version production runs, and do you need to roll back
+2. Is processing the same message twice harmful, or only wasteful?
+3. How do you decide which code version production runs, and do you need to roll back
    without redeploying?
-5. Does per-key ordering matter?
-6. What language is the subscriber written in? Python means the SDK and none of the
-   raw-API work below.
+4. Does per-key ordering matter?
+5. Should runs be attributed to the originating user or tenant? The app calls Flyte with
+   its own credentials, so that identity has to travel in the message and be enforced in
+   the pipeline.
+6. What language is your event tooling? Python means the SDK and none of the raw-API
+   work below.
 
 ---
 
 ## Appendix: callers that are not Python
 
-Flyte 2's control plane is served over Connect RPC, which accepts plain `POST` + JSON
-over HTTP/1.1 — no protobuf toolchain or code generation required.
+Flyte 2's control plane is served over Connect RPC, which accepts `POST` + JSON over
+HTTP/1.1 — no protobuf toolchain or code generation.
 
 ```
 POST /cloudidl.workflow.RunService/CreateRun
 Authorization: Bearer <token>
 ```
 
-The awkward part is not the transport but the inputs: task inputs are typed protobuf
+The difficulty is not the transport but the inputs: task inputs are typed protobuf
 literals, so an integer is `{"scalar": {"primitive": {"integer": "42"}}}` and files are
 more involved. Two ways around it — give the task a single string input carrying the raw
 message and parse inside the task, or put a thin Python service in front. The first is
-usually right; keeping the subscriber in Python avoids the question entirely.
+usually right.

@@ -8,4 +8,4 @@ drop-in products — every one lists the questions that would change the design.
 
 | | |
 |---|---|
-| [pubsub-to-flyte](./pubsub-to-flyte/) | Launch Flyte 2 tasks from Google Cloud Pub/Sub, using a customer-owned pull subscriber. Worked example reacts to files landing in GCS. |
+| [pubsub-to-flyte](./pubsub-to-flyte/) | Launch Flyte 2 tasks from Google Cloud Pub/Sub. A pull subscriber runs as a Union App; the worked example reacts to files landing in GCS. |
