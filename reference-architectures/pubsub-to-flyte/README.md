@@ -6,7 +6,8 @@
 
 | File | |
 |---|---|
-| `app.py` | the subscriber, deployed as a Union App |
+| `artifact_chain.py` | artifact-triggered chaining, for events that originate inside Flyte |
+| `app.py` | the Pub/Sub subscriber, deployed as a Union App |
 | `gcs_ingest.py` | example task, accepting an object key |
 
 ## Scope
@@ -20,7 +21,43 @@ most common source. The pattern is the same for any publisher.
 
 ---
 
-## 1. Architecture
+## 1. Choosing an approach
+
+Two designs, and the choice is where the event comes from.
+
+**Inside Flyte — use an artifact trigger.** A task publishes a new version of a named
+artifact, and any task with an `OnArtifact` trigger on that name runs automatically with
+the artifact as an input. No subscriber, no credentials, no delivery semantics. See
+[`artifact_chain.py`](./artifact_chain.py).
+
+```python
+on_new_data = flyte.Trigger(
+    name="on_new_dataset",
+    automation=flyte.OnArtifact(name="incoming_dataset"),
+    inputs={"dataset": flyte.TriggeredArtifact},
+)
+
+@env.task(triggers=[on_new_data])
+async def consume(dataset: File) -> str:
+    ...
+```
+
+**Outside Flyte — observe the event.** If data arrives from a partner, another team, or
+a system you cannot change, nothing publishes an artifact and nothing fires. The event
+has to be observed, which is what the rest of this document covers.
+
+Registering an externally-created object as an artifact does not bridge the gap: you
+would still need to notice the object before you could register it, which is the
+original problem.
+
+Prefer the artifact trigger where the producer is a Flyte task. Everything below exists
+for the case where it is not.
+
+> Publishing from inside a task currently requires passing `external_ref` to
+> `Artifact.create()`. Without it the SDK derives provenance from the running action but
+> omits org, project and domain, and the server rejects the request.
+
+## 2. Architecture
 
 A **pull subscriber running as a Union App**. It reads the subscription and launches one
 Flyte run per message.
@@ -76,9 +113,9 @@ drains, that decides whether you launch a controlled number of runs or a flood.
 
 ---
 
-## 2. Configuration
+## 3. Configuration
 
-### 2.1 Pub/Sub
+### 3.1 Pub/Sub
 
 | Setting | Recommendation |
 |---|---|
@@ -92,7 +129,7 @@ drains, that decides whether you launch a controlled number of runs or a flood.
 For a GCS source, filter server-side by object prefix and event type so unrelated bucket
 activity never reaches the subscriber.
 
-### 2.2 IAM
+### 3.2 IAM
 
 Four grants needed:
 
@@ -105,7 +142,7 @@ Four grants needed:
 
 Scope grants to the specific topic or subscription rather than the project.
 
-### 2.3 Credentials
+### 3.3 Credentials
 
 The app needs two, in opposite directions.
 
@@ -119,7 +156,7 @@ whoever created it. Rotate on a schedule.
 Create the secret before deploying. If it is missing, the pod is rejected with
 `none of the secret managers injected secret` and the app fails to start.
 
-### 2.4 App settings
+### 3.4 App settings
 
 Two settings matter:
 
@@ -129,7 +166,7 @@ Two settings matter:
 - A listener on the app port. The platform health-checks it, and `app.py` serves
   `/health` reporting whether the stream is still running.
 
-### 2.5 Which task version runs
+### 3.5 Which task version runs
 
 The subscriber should name a release label, never a code version, and should not resolve
 "latest" — that makes every deploy an immediate production change with no way to pin or
@@ -149,7 +186,7 @@ content hashes and awkward to promote by hand.
 
 ---
 
-## 3. Reliability
+## 4. Reliability
 
 These are properties of Pub/Sub, and they decide how the integration behaves under load
 and failure.
@@ -177,7 +214,7 @@ dead-letter queue for messages that never launched.
 
 ---
 
-## 4. Mapping messages to task inputs
+## 5. Mapping messages to task inputs
 
 The only bespoke code. Decoding the message body and passing it straight to the task
 works when you control the publisher and shaped the payload to match the task signature.
@@ -204,7 +241,7 @@ deletes and metadata updates through the same subscription.
 
 ---
 
-## 5. Observability
+## 6. Observability
 
 **Log every decision.** An app that logs nothing looks the same whether it is working or
 stalled. Log on launch with the run name and URL, on duplicate delivery, on skip, and on
@@ -225,7 +262,7 @@ platform sees the difference.
 
 ---
 
-## 6. Try it yourself
+## 7. Try it yourself
 
 Around 30-45 minutes. Substitute your own project, bucket, and subscription.
 
@@ -326,7 +363,7 @@ A run appears in the Flyte console within seconds.
 
 ---
 
-## 7. Open questions
+## 8. Open questions
 
 To size this for your environment:
 
