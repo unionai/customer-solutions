@@ -23,11 +23,10 @@ most common source. The pattern is the same for any publisher.
 
 ## 1. Choosing an approach
 
-Two designs, and the choice is where the event comes from.
+There are two proposed designs where the choosing criteria is where the dataset/model is produced:
 
-**Inside Flyte — use an artifact trigger.** A task publishes a new version of a named
-artifact, and any task with an `OnArtifact` trigger on that name runs automatically with
-the artifact as an input. No subscriber, no credentials, no delivery semantics. See
+**Inside Flyte -> use an artifact trigger.** A task publishes a new version of a named
+artifact, and any task with an `OnArtifact` trigger automatically runs on every new artifact version. No subscriber, no credentials, no delivery semantics. See
 [`artifact_chain.py`](./artifact_chain.py).
 
 ```python
@@ -42,9 +41,50 @@ async def consume(dataset: File) -> str:
     ...
 ```
 
+The run is linked to the artifact version that fired it, so there is no state to keep
+outside the platform. Run history answers which artifact version produced which run and
+how it ended.
+
+`TriggeredArtifact` also binds the artifact straight to a task input. The task signature
+is the contract:
+
+```python
+async def consume(dataset: File) -> str:
+```
+
+The artifact arrives typed, already the thing the task needs. Nothing decodes a payload,
+reads attributes, or converts types — see [section 5](#5-mapping-messages-to-task-inputs)
+for what that costs on the queue path.
+
 **Outside Flyte — observe the event.** If data arrives from a partner, another team, or
 a system you cannot change, nothing publishes an artifact and nothing fires. The event
 has to be observed, which is what the rest of this document covers.
+
+### The cost of a queue: acknowledgement is not completion
+
+A subscriber has to ack as soon as the run is created. Waiting for the run to finish
+exhausts the ack deadline and triggers redelivery, which launches duplicates. So the ack
+means *launched*, not *succeeded* — and once acked, the message is gone.
+
+If that run then fails, the queue has no idea. Flyte retries within a run, but a run that
+ends terminally failed is invisible to Pub/Sub: there is no message left to redeliver, and
+nothing to dead-letter.
+
+Closing that gap means owning a reconciliation of your own:
+
+- which events produced runs, and how each run ended
+- which failures should be re-fired, and which must never be — a partially applied
+  side effect is usually worse than a missed one
+- how a re-fire avoids colliding with the `messageId`-derived run name that exists
+  specifically to prevent duplicates
+
+None of that is exotic, but it is a second system holding state about the first, and it
+has to stay correct while both evolve.
+
+An artifact trigger has none of it. The trigger runs inside the platform, the run is
+recorded against the artifact version that fired it, and failures appear in run history
+like any other run. There is no acknowledgement to get right, no dead-letter queue, and
+no separate record of which events have been handled.
 
 Registering an externally-created object as an artifact does not bridge the gap: you
 would still need to notice the object before you could register it, which is the
@@ -189,7 +229,8 @@ content hashes and awkward to promote by hand.
 ## 4. Reliability
 
 These are properties of Pub/Sub, and they decide how the integration behaves under load
-and failure.
+and failure. They are the price of putting a queue between the event and the run; the
+artifact trigger in section 1 avoids all of them.
 
 **Delivery is at-least-once.** Duplicates will happen. Derive the run name from the
 Pub/Sub `messageId`: run names are unique per project and domain, so a redelivery
@@ -216,9 +257,12 @@ dead-letter queue for messages that never launched.
 
 ## 5. Mapping messages to task inputs
 
-The only bespoke code. Decoding the message body and passing it straight to the task
-works when you control the publisher and shaped the payload to match the task signature.
-It does not work for cloud-generated events.
+The only bespoke code on this path, and the only part an artifact trigger does not need:
+`TriggeredArtifact` delivers a typed artifact to the task input directly.
+
+Decoding the message body and passing it straight to the task works when you control the
+publisher and shaped the payload to match the task signature. It does not work for
+cloud-generated events.
 
 GCS object notifications put routing data in `attributes` and the object *resource* in
 `data`:
@@ -238,6 +282,10 @@ inputs = {"object_key": f"gs://{attrs['bucketId']}/{attrs['objectId']}"}
 
 Filter on `eventType` as well. A bucket configured for several event types delivers
 deletes and metadata updates through the same subscription.
+
+This mapping is yours to maintain. It has no type checking against the task signature,
+and it breaks silently when the event schema changes or the task inputs do — a mismatch
+surfaces as a failed run rather than a deploy error.
 
 ---
 
